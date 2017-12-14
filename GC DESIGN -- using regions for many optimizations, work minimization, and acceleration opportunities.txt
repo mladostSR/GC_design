@@ -1,0 +1,929 @@
+GC DESIGN -- using regions for many optimizations, work minimization, and acceleration opportunities
+
+Benefits of allocating differently sized objects from different regions:
+
+Variable-length pointer/ref tag portion(s):
+
+[sys_rserved][tag_prefix] actual addressing part [tag_suffix]
+
+For objects which cannot/need not/should not => by design WILL NOT be smaller than X bytes, where X is a power of 2; and which will ALWAYS BE ALLOCATD NOT TO BE MISALIGNED TO THAT GRANULARITY; we can use quite a few LSBits for tagging purposes.
+alignment/cell size (Bytes)        LSBits usable for tagging
+---------------------------       ----------------------------
+8                                 3
+16                                4
+32                                5
+64                                6
+
+It is clear that in modern environments with any form of GC, object cell size < 8 Bytes makes no sense. We can actually claim the same for 16B; on 64-bit systems (the norm), 32B and even 64B can be used with practically unnoticeable or easily tolerable memory waste (and tremendous other perf benefits). After all, on 64-bit systems a native pointer and long int are 8B, as are double floats anyway, and we can safely assume that objects will almost alays contain 4 or 8 native machine words (espcially if the object is headered, with class ptr, which most are anyway).
+
+embedded in-ref/in-ptr flags:
+1: P(arallel) bit: can this object posibly be accessed in parallel by another thread? => synchronization...
+2: H(eadered) object or non-headered?
+3: GC/refc header location: on-object or off-object in external object map (objmpap); this allows per-type and even per-obj tuning
+4: L(eaf) bit: is this object a leaf in the object graph (i.e., does it contain refs/ptrs that POTENTIALLY need scanning)
+5: RC (Refcount) bit: the object is refcounted
+6: F(inalization POTENTIALLY required)-bit
+-------------------------------------
+7: X-bit (xtended tag, as object is big and allocated on a greater cell boundary)
+
+
+Hmm, how many can we get from prefix???
+It could/would in general be sueful to have at least 4-5 more flags available...
+
+
+
+
+NOTE: Memory management and exception handling:
+Upon failure to dynamically allocate a buffer for DYNAMIC EXCEPTION HANDLING, the task MUST be aborted with ENOMEM(EH).
+
+The LAYERED EXCEPTION HANDLING MODEL:
+LEVELS/LAYERS of the EH model:
+1. Spartan: very small, constant memory space reserved for ach task/tasklet on its creation.
+2. Minimalistic:
+3. Balanced
+4. Balanced Debug
+5. Extended
+6. Extended Debug
+7. Super Extended Debug
+
+Levesl 1, 2 are intended for very-high perf and/or realtime applications, with determinism.
+Level 3 is intended for soft-RT high-perf applications, and moderately complex distributed applications.
+Level 4 is intended for general applications, and/or complex distributed ones.
+Level 5 and 6 offer extra, but costly, facilities for debugging.
+Level 5 (Extended) and onwards REQUIRE a GC for avoiding (usually small) memory leaks; All levels up to 4 (Balanced Debug) DO NOT REQUIRE A TRACING GC.
+
+
+
+
+
+
+
+
+
+
+GC and memory mgmt ideological stuff (ideological in a good sense...)
+1. Purely tracing GC is bad ideology in a similar way as refcount-only or manual memory manageemnt only disciplines are. Meanigful and viable hybrids are possible; usually they will lean more towards tracing or refcount -- depending on what, when, how, why, is desired of an application or system. THIS IS FINE.
+2. There are KINDS and TYPES which are INTRINSICALLY WELL/BETTER SUITED FOR EITHER, and there are ones which have  NO SUCH NATURAL BIAS. Same with groupings of kinds and types, such as packages/modules; entire tasks/tasklets/agents too.
+3. One size fits all => bad GC or mem mgr.
+4. Powerful language expressivity and type system fatures allow for powerful and practical compiler analysis, and low-cost and thus practial runtime actions to support optimizations that make a big difference. OWNERSHIP AND THE TRANSFER OF IT, SMART REFCOUNTING, SMART REFCOUNT+TRACING HYBRID GC... follow or are inhibited by those things.
+5. Refcounting is sometimes very expensive, sometimes not so much, and sometimes actually fairly cheap -- by tiself and when compared to the full, spread-out costs of tracing (and re-tracing).
+6. Clear ownership and dataflow patterns make smart refcounting much more viable; irregular/ad-hoc flows and graphs (usually) work better and easier to program correctly under a pure tracing GC.
+7. Objcts of different sizes OFTEN do NOT mingle well.
+8. Objcts of different lifetimes OFTEN do NOT mingle well.
+9. Copying for compaction is often overrated; COPYING MUST BE DONE FAIRLY SMARTLY TO BE TRULY EFFICIENT AND NOT A CHOKEPOINT (or several chokpoints: pause time, ref->actual ptr remaps/updates, cross-thread sync, cache pollution, RAM traffic, NUMA traffic, and a few others). MOST copying is usless for well-written programs -- and trying to rescue poorly architected programs by GC and compiler magic is FUTILE AND WRONG.
+
+Samrt refcounting:
+1. Avoid useless INC then DEC, DEC then INC sequences.
+2. Mutate coutn only when it actually makes sense.
+3. Counter can in principle be initalized to higher than 1, if at the poitn of object cration it is clear how many owners it will have (useful and
+doable in some well-structured, mostly pipeline-structured, parallel uses, and for some common tree-based datastructures, plus a few non-tree ones).
+4. Counter can be incremented/ecreemnted by >1, which again is a valuable optimization hich is quite feasible in well-srcutured patterned situations.
+5. Atomic refcounting is helped very much by caching on modern CPUs; atomics are actually fairly inexpensive if executed in a  close succession while the counters are still hot in the local L1 or L2 cache, and still often fairly tolerable if hot in the L3; crossing sockets is costly though. s is manipulating refcounts sitting in RAM and not in any node-local cache level... Basically, an ordinary non-cached RAM access or two -- i.e. normal cache misses -- are the main overheads; additional atomics overhead is most often small, or worst case comparable, to regular cache line miss and having to go to DRAM/another socket's DRAM. OF COURSE, having unaligned refcounts on which to execute atomics is a BAD IDEA EVEN IF ARCH ALLOWS IT. Clear ownership rules, and clar/effective onwership-aware architecture falicitate the preservation of locality of reference to the home thread(s) -- if not fully, then to a very dominant extent.
+
+Big(gish) objects REALLY SHOULD BE FREED/RECLAIMED QUITE TIMELY. IT IS MORE OFTEN NOT OK TO KEEP TYHEM AROUND HOPING FOR EFFCIIENCY GAINS WHEN GC COMES AND SWEEPS THEM "in one fell swoop" -- it's too often too late and too little of amortized costs savings.
+- Programs allocating non-small arrays and array-like/array-based objects can easily cause puely-tracing GC inefficienciencies and/or trick that style of GC into pathologial behavior. Thi can most often be remedied by giving the GC more free heap to play with -- cost is memory bloat, virtual memory address space bloat and ensuing TLB pressure, swapping thrashing, and sometimes serious time waste for re-tracing thrashing when (parts of) the heap(s) keep being re-scanned over and over again only to clan a relatively small number of dead biggish objects which a refcoutn would have dealt with promptly.
+
+It is possible for a traced objct's firing finalizer (fin) routine to automatically issue a refcount update on pointed-to object; it is also very useful to expedite the deallocation of that.
+
+Remember: 1M of 1KB each objects  = 1 GB heap; 1K of 1MB ach objects  = 1 GB hap, too.
+
+Mostly tracing GC is largely unsuitable for many seriously-RT and/or seriously-interactive application scenarios. "Small" GC pauses of "only" 10s of ms, or "bounded" to just "100ms" or "200ms" is too often intolerable (killed frames, sound stuttering, network delays that accumulate when compounded over several hops/systems/sofware layers/middleware + backends, unresponsive GUI or webUI, and similar. Modern users and use cases are growing ever more intolerant/impatient; non-prompt GC is less and less OK.
+
+7. CPU effort is usually, and increasingly, much cheaper than RAM waste. On servers, on HPC machins, on dsktops and laptops, on ultraportabls and tablets, and on smartphones and smaller smart devices (such as smartwatches, bracelets, and other wearables). The kore and/or mbedded a device:
+7.1. The less DRAM can be feasibly and economically crammed into it;
+7.2. The fewer genearl-purpose CPU cores it has, and the less heavily-multithreaded apps it runs => rfount ovrhead and inefficiens are quite overestimatd for this broad class of devices.
+7.3. It's easier, past a point already more or less reached, to add CPU cores than DRAM capacity *AND* DRAM BADNWIDTH/CHANNELS; TRADITIONAL purely or mostly tracing GC is effective and efficient ONLY when it ahs a lot of those 2, together. OUR SYSTEM IS DIFFERENT, BUT STILL, SMART TRACING IS STILL TRACING.
+
+
+
+APPROPRIATE OBJECT SIZE ROUNDING IS KEY TO RAPID MEMORY MANAGEMENT, GC or NOT.
+
+If object alignment, thus object cell, is 32B, then 64B (1 typical cacheline size) worth of bitmap can cover 64*8 = 512 object cells = 512*32B = 16KB space. For 64B object cell: again 512 cells, 32KB space.
+
+Intermingling objects of vastly different sizes MAY BE OK if these are of a same or very similar liftime an even more so if residing in the same region (rgion-based allocation), so can be freed/compacted away together. BUT IF NOT, HOLES WOULD OCCUR AND LAST UNTIL COMPACTION, AND COMPACTION WILL MSOT PROBABLY BE NON-CHEAP AS NON-SMALL OBJECTS ARE NOT CHEAP TO COPY AROUND. ALSO, COSTS WIL BE VERY UNPRDICTABLE, AND ALLOC-DALLOC PATTERN DEPENDANT => BAD FOR RT.
+And anyway, SEGREGATING OBJECT OF SIGNIFCANTLY DIFFERENT SIZES BY DEFAULT IS A GOOD THING. IT CAN BE INFFICIENT IF THEY BELONG TO THE SAME RCORDS/BUFFERS IN THINGS LIKE DATABASE DATASETS SO MARSHALLING/SERIALZIATION WOULD REQUIRE COPYING BACK AND FORTH; this ca be alleviated via default palcement override and, natuarlly, region-based allocation -- high-perf DB code NEEDS some manual tuning anyway.
+NOTE: WHEN OBJCTS NEED TO STAY TOGETHER AS MORE OR LESS RECORDS/FIELDS OF THE SAME OBJECT, THEN MAKE THEM SUCH, WITH IN-LINE PLACEMENT/CONTAINMENT. ANY DECENT LANGUAGE MUST SUPPORT THAT!
+
+Examples of how NOT to allocate together long-lived/non-region-as-a-whole released objects of seriosuly disparate sizes: 1KB 30B 1.2KB 55B 512B 330B 2KB ...
+
+
+Allocating objects of disparate sizes from different (sub)heaps presents various optimization opportunities:
+- When bitmaps/bitcards or refcount maps are used (e.g. as general allocator bitmaps, or for tracking inter-region links), a coarser granularity saves AUX RAM, makes the structures more cacheable, and lower CPU cycle costs for search/traversal/marking. CHOOSING HTE RIGHT GRANULARITIS GOES A LONG WAY TOWARDS OVERALL BALANCED SYSTEM EFFICIENCY.
+- EFFECTIVE (EXTERNAL) FRAGMENTATION IS REDUCED at the typically small expense of a little wasted space (internal fragmentation) caused by objct size rounding. Using a meaningfully designed set of STANDARD OBJECT SLOT SIZES reduces the chance of not being able to find viable slots for allocating an objct due to fragmentation and the need to compact (often). STANDARD OBJECT SIZES MAKE EFFICIENT FREELISTS MUCH EASIER AND EVEN MORE CPU, CACHE, RAM EFFICIENT, too.
+- Different: typical lifetimes, refcountability vs circular referential patterns, finalziation requirements, needs for compaction, feasibility of effective compaction, cacheability and cahce accss patterns, DMA/rDMA-ability, etc. Object kinds and object sizes ARE VERY VERY CORRELATED AND THIS SHOULD BE EXPLOITED.
+- If done right, this will almsot fully obviate the need for off-heap storage for performance.
+- Refcountability: Medium-sized and large objects tend to be refcountable, and most often SHOULD be refcounted as 1st line of dallocation trigger.
+-- Typically, few incoming refs.
+-- Refcount ops on those are typically infrequent (they are not frequently linked to or unlinked -- one rarely allocates, connects to or drops large-ish buffers, arrays of many objects, etc.) AND they are well amortized over the size and lieftime of those objects.
+
+Common useful and simple to handle standard object sizes:
+32B } Elementary object cell
+64B }
+----------------------------------
+128B
+256B
+512B
+----------------------------------
+1KB
+2KB
+4KB
+8KB
+16KB
+32KB
+64KB
+128KB
+256KB
+1MB
+2MB
+4MB
+
+It often makes sense to provide bypasses/segregate objects for special, precise power-of-two object sizes which libraries and perf-conscious programmers use anyway.
+
+Efficient and balanced allocation granularities:
+Size : GRANULARITY
+<1KB : standard obj cell 32/64B
+1KB-16KB: 1KB cell ???
+special bypass 1KB, 4KB, 16KB, 64KB, 
+
+-----------------------------------------------------
+!!! DELAYED/BACKGROUND COMPACTION and its controls
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----------------------------------------------------
+
+GC support for nested (inline-allocated/contained) objects:
+- CONTAINING OBJCT TYPES HAVE ADDITIONAL SPECIAL HEADERS
+obj_hdr_container: jumplist containing INTERNAL AUTO-MANAGED offsets to the START OF EACH CONTAINED OBJECT/RECORD FIELD.
+-- the jumplist is (Nobjects, flags, space[...]):
+--- For proper containers, Nobjcts is a uint32 value:
+--- For "records", i.e. simple common object nesting, 1 Byte only is enough: 0..255 entries
+
+Flags: 
+slot | bit positions | Nbits
+1    | 0             | 1          | 0->record; 1-> proper container
+2    | 1             | 1          | 0-> irregular structure (NOT an array); 1-> array
+
+
+??? Common object header bits:
+Record-bit: 0-> is considered a structured record; 1-> isn't
+Array-bit: is a regularly structured array
+HasRefs-bit: contains references, i.e. is/may be subject for GC-scanning
+Immutable-bit: is the obj fully immutable?
+
+
+NOTE: IMMUTABLE OBJECTS HAVE SOME GREAT ADVANTAGES IN GC SIMPLICITY AND OFTEN PERF FOR ADVANCED GC FUNCTIONALITIES:
+- compaction/copying/moving: we can safely create a copy of the obj in the background then retarget the ref/ptr; we need NOT track/write-barrier accesses to the object in the meantime -- writes are impossible by definition
+- atomic ops or locks on obj header fields are (normally) NOT needed, as the header of an immutable object will (normally) be immutable itself
+
+
+
+Memory Manager/GC regions (it si about MORE than GC-mode)
+-----------------------------
+Flags:
+- Compaction/Object Relocation WITHIN region allowed: 1 bit
+- Compaction/Object Relocation OUTSIDE region allowed: 1 bit
+
+- Slab Allocator: 1 bit
+- List-based Allocator ("classical malloc")
+- Allocator
+- Temporary Buffer-style (Non-freeing) Allocator
+- Ring Buffer style Allocator
+- Refcounted INTRA-links
+- Objtable-refcounted INTERregion links
+- Manual Free Allowed: yes/no
+- Dominant MM/GC mode: { refcount-only, tracing-only, mostly-refcounting, mostly-tracing, manual-only, tribrid (manual, tracing, refcount) }
+
+- Region Space Structure: Chaining etc.
+-- Chaining: yes/no (If it is NOT chained, it is said to be a MONOLITHIC REGION)
+
+
+- CELL_SIZE of the region: 32B, 64B, 128B, 256B, 512B, 1KB, ...
+
+Stats/counters:
+Nobjs
+FreeSpace, (derivative) % free space
+(derivative) PercentFreeSpace
+LargestObj
+SmallestObj
+AvgSize
+LargestContiguousFreeSpace
+SmallestContiguosFreeSpace
+
+
+Compaction: Compact ONLY when criteria are met. Do NOT be a crutch to poorly designed programs which do not brak up objects when they should/must, or which - on the opposite - do break up too much.
+
+Criteria: how beneficial would it be to go to the expense of compacting?
+- criterion (easy and cheap): % free space. Not a very useful metric by itself.
+- criterion (still cheap): % non-contiguous space (=== fragmented space). Contiguous is only the free space part of the contiguous block to the "right"/"higher end" of the address space covered by the region (for MONOLITHIC REGIONS; a slight generalization applies to chained regions).
+REGIONS have a FILLING/ALLOCATION DIRECTION: left-to-right, low-to-high addresss (just like young spaces).
+- criterion AVERAGE FRAGMENT SIZE: the lower the fragment size, the higher the fragmentation (well, superficially; we can in principle have lots of small fragments which waste little space and most of free space in a few quite useable chunks... but still it's a good metric)
+- criterion mean squares of fragment size: this defers compaction when medium and large free chunks exist. Squares need not be true mathematical squares requiring multiplication; simplifications coudl be used.
+NOTE: ALL sizes are in ELEMENTARY CELLS; NOT in BYTES!!!
+In this way, numbers are smaller by 32 or 64, or more if the region uses larger cells... can use uint16 or uint32 compactly in many cases.
+- !!! ExpectedLifecycleType and AgeHistory are taken into account too.
+Expected lifecycle type: a region can be tagged with the following on creation, and possibly retagged dynamically by the GC:
+{ 0->ephemeral; 1->young; 2->junior; 3->middle_aged_1, 4->middle_aged_2, 5->senior_1, 6->senior_2, 7->tenured, 8->ancient, 9->permanent, 10..15-> reserved}
+Fragmentation History counters: keep % fragmented, avg_fragment_sz history over last 3 collections, for some medium-term and long-term perspective.
+
+Runtime launch parameter: compact_region threshold: 10%, 15%, 20%, 25%, 30% 
+
+Large objects: objects >=32KB are allocated at a granularity >=1KB.
+
+Movability of large objects: objects >16MB are NEVER MOVED by compaction. Objects>4MB are moved very reluctantly. Objects >1MB are moved reluctantly.
+This is done to avoid thrashing by the compactor, and being a crutch to poor design of programs (bad sizing and ignorance of allocation/deallocation patterns).
+
+NOTE: for large objects, using remapping in the virtual address space is cheaper than cpying compaction. Especially on 64-bit platforms, there is quite a lot of available address space to remap existing objects to.
+
+-------------------------------------------------------------------------------
+
+Why some (costly) refocunt updates can be queued safely for later execution:
+Refcounts are, of course, additive. The just need to happen in full, the right number of times; the exact time and order of application do NOT matter -- promptness does NOT require absolute immediacy.
+WE MUST HOWEVER BE CAREFUL, IN A HYBRID ENVIRONMENT, NOT TO CREATE (SUBTLE) RACES/CONFLICTS BETWEEN OBJECT LIVENESS DETECTED BY REFCOUNTING AND BY TRACING GC:
+- It is possible to have deferred refcount updates still unporcessed when tracing determines an object unreachable and frees it.
+=> Solution: A SUFFICIENTLY EARLY tracing GC phase MUST drain and fully commit to memory ALL DEFERRED REFCOUNT UPDATES.
+- A potentially good thing is that as long as tracing GC still thinks an object is reachable, then it is safe to apply refcount updates to that object. That is, until the (final) marking GC phase has [started] ENDED (i.e. as long as objects could still be marked as live, therefore no garbage has been "thrown out" byt the GC yet), concurrent refcount application is safe.
+
+MOVING GC: SLIDING IN-PLACE COPY VS COPYING TO A NEW HALF-SPACE
+
+Concurrency with small hiccups: VERY INCREMENTAL COPYING ENABLED BY AN "OBJCT BUSY" STATE
+- NOT good for perf on small objects -- huge overheads, small benefits.
+- CRITICAL for large and huge objects.
+
+Objects can be available or unavailable for normal use.
+Reasons for unavailability:
+- Object is tagged as damaged: partial failure reliability functionality.
+- Object is BUSY.
+Where are these states marked? In the OBJTABLE, which does the REF->PTR translation for managed code.
+If busy, the thread/task attempting access can:
+- spin for a short time, while the concurrent relocation or another GC/runtime background activity finishes working on the object.
+problems: how long? What if the activity is not actually happening concurrently -- we could be stealing CPU from it by busy looping...
+Solutions:
+1. IF ACTUAL RELOCATION OR ANOTHER GC/RUNTIME MAINTENANCE OPERATION HAS INDEED STARTED (OBJECT IS LOCKED), then use regular locking porcedures ourselves to wait on the op to finish: use an actual mutex, which spins for a (very) short time then pauses the accessor via regular OS mechanisms.
+2. if the ACTUAL RELOCATION OR ANOTHER GC/RUNTIME MAINTENANCE OPERATION HAS NOT YET TRULY STARTED ON THE OBJECT: do it ourselves, on the accessor thread! Lock - perform maintenance op - unlock - do what we were originally about to do.
+
+IMPORTANT: to ensure efficient/reasonable copying performance and relatively inexpensive locking; the GC_RELOCATOR thread(s) VER YVER YSTRONGLY SHOULD (NEARLY MUST) RUN ON THE CPU SOKCET AND PREFERABLY CORE GROUP AND PREFERABLY CORE WHICH OWN THE OBJCT IN QUESTION AND WHERE THE ACCSSOR THREADS NORMALLY RUN. This often makes the difference between tolerable and untolerable object copying/compaction!
+
+
+-------------------------------------------------------------------------------
+PERF CRITICAL: THROUGPUT AND LATENCY CRITICAL, RT-CRITICAL:
+SYSTEM TOPOLOGY, OWNERSHIP, PINNING, AND MM/GC
+NUMA is the present and the future.
+There are different types of NUMA with vastly different degrees and typs of performance implications and approaches to handle:
+1. - in-die ("tiny") NUMA: when 1 monolithic die has >1 RAM conntrollers, with some of the cores/core complexes being somewhat to moderately "closer" to a certain controller
+2. - in-MCM (in-multi-chip-module) ("small") NUMA: when in addition to a possible in-die NUMA topology we also have 2,3,4 and maybe more closely interlinked but still physically separate CPU die on a common substrate (Threadripper, EPYC, ...)
+3. - cross-socket NUMA ("big" NUMA): when in addition to a possible in-MCM NUMA topology we have "true" NUMA crossing SOCKET boundaries
+4. - cross module/board "big iron" NUMA: when in addition to cross-NUMA topology we also have a large SMP machione made up of several pieces of mainboard, posibly sitting is several racks/boxes/chassis units (e.g. some large Intel servers, Power servers, etc.)
+5. Remote/Distributed configurations.
+
+The latency, bandwidth, and competition for synchronization and memory traffic implications naturally grow, rapidly, 1->4.
+With 1 we can largely get away fore free.
+2 starts to require design features what belongs where; 3 definitely requires a lot of that; and 4 presents serious challenges.
+
+What we do about locality of reference in topologies:
+
+Levels of topological hierarchy OWN haps, objects, threads/tasks -- in a controlled fashion, with defaults + programmer/admin input (control parameters).
+Queues for anything (mesage passing, tracing GC, deferred refcounting, and others) are aware of topology.
+GC threads/tasks (marking/tracing, copying/compaction, finalization, and others) and other service threads/tasks and work units (WUs) are aware and scheduled accordingly.
+Heaps and memroy regions are designed to be aware and assist locality.
+
+
+Key ownership and topological binding user-settable (at program launch) control paramters:
+-
+-
+- 
+
+
+Larger machine models by necessity involve more queueing of operations/work units, and more placement and scheduling decision-making and execution ovrheads.
+Batching is the main weapon against lock thrashing and slow non-local memory accesses (especially bulk ones, such as copying or scanning).
+
+Locality during scanning: GC_SCANNER threads try to run clsoe to the memory regions/heaps they service.
+
+Deferred refcounting:
+1. Each task/thread collects a small OUTGOING Q of Deferred Refcount Ops Work Units (DRO-WU) in its private thread-local space.
+2. Each HEAP/PRIMARY MEMORY REGION has an INCOMING Q for DRO-WUs, again in a private space.
+3. 
+
+source task/thread: [OUTGOING BUFF] -copy1-> [INTERMEDIATE BUFF -- NEUTRAL, NON-PRIVATE TERRITORY] -copy2-> [TARGET PRIMARY MEM REGION BUFFER] : Mem Region OWNING THREAD
+
+Copy1 happens when source feels like it???
+Copy2 happens when target feels like grabbing a batch???
+
+NORMAL, I.E. NON-DEFERRED REFCOUNTS STILL HAPPEN IMMEDIATELY, USING ATOMICS AS NECESSARY!!!
+
+HOW DO WE DECODE WHICH MEMORY REGION OWNS AN OBJECT, SO THE DEFERRED OP CAN BE ROUTED TO IT?
+GC_get_owner_primary_region(ref)
+A Primary Memory Regions Table (And a Subordinate Memory Regions table, too, but that's for other purposes)
+Option 1: High N bits of REF (NOT machine ptr, as object may have been relocated!!!) -> Primary Region ID
+or
+Option 2: The OBJTABLE ref->ptr can have every object bear a tag with the Primary Region ID
+or
+Option 3:  The object's header itself (for headerless objects, in the external header).
+
+
+There need to be, of course:
+- GLOBAL REGIONS
+- GROUP REGIONS: shared between various groups of cooperating tasks/threads
+
+
+
+Memory region owning thread: A single thread dsignated as the owner of the memory region.
+
+
+Hmm.
+[Primary Region ID][Subordinate Region ID]
+GC/MM Owning thread ID === Primary Region ID, by design
+How many Primary Regions though, how many GC/MM threads (and how many active at the same time...)
+Too many is NOT good, actually QUITE BAD due to extra synchro and OS scheduling and context switching overhead, and memory wastage for stacks... private unmanaged heaps...
+
+
+!!! PERF CRITICAL: THREAD/TASK/WORK UNIT CLASSIFICATION:
+1. BOUND: Permanently bound to specific execution unit:
+1.1. Node in distributed scenarios
+1.2. System board in "big iron" NUMA
+1.3. socket/"big" NUMA domain
+1.4. MCM unit/"small" NUMA domain
+1.5. Adjacent sub-chip core group/"tiny" NUMA domain
+
+Placement address: coregroup.die.socket.board.node ("dotted five").
+
+2. FREE_TO_ROAM: Roaming across potentially any and all execution units, as the OS sees fits
+
+3. SEMI_BOUND_STRONG: 
+4. SEMI_BOUND_WEAK: The thread... has a an expressed preference to where it would like to run, but this is weak, i.e. only a hint to the OS scheduler
+-------------------------------------------------------------------------------
+
+
+
+
+
+-------------------------------------------------------------------------------
+GC/MEM MGMT AND FINALIZATION
+
+!!! NOTE: Tombstones or tombstone mark in OBJMAP for allowing safe manual/mergency finalization.
+
+FUNDAMENTAL REQUIREMENT N. 1: the language guarantees that finalization (of course, except slpit finalziation) will NOT happen MORE THAN ONCE.
+FINALIZATION IS IN GENERAL *NOT* GUARANTEED TO HAPPEN, BUT THE LANGUAGE AND GC MAKE EFFORTS TO ENSURE A VERY HIGH LIKELIHOOD WHERE IT MAKES SENSE (e.g. the OS wouldn't auto-clean promptly anyway).
+
+FEATURE for scalability, responsiveness, and RT-enablement: SPLIT FINALIZATION.
+Finalization routine(s) of a type OR SPECIFIC OBJECT can be split in portions, so that not all of the (potentially large) amount of work has to execute at once, allowing for delaying and/or batching non-time-critical parts of it.
+The following types of finalization timing classes apply:
+FIN_{IDLE, BACKGROUND, FOREGROUND, PROMPT, URGENT, IMMEDIATE}
+IDLE: executes in AN idle task/thread of the finalizer: idle.fin.gc -- that is, when the system has enough resourcs to run idel priority threads/tasks.
+BACKGROUND: -||- background priority (somewhat higher than background) ... : bgnd.fin.gc
+IMMEDIATE: is ALWAYS executed rigght away ON the thread which has determined the object is to be finalized. Coudl be a user thread, could be a GC scanner thread -- doesn't matter much.
+URGENT: runs in a high-priority urgent.fin.gc thread.
+PROMPT: somewhat lower priority
+FOREGROUND: executed at normal application priority, fg.fin.gc
+
+
+Queueing used and number of actual GC threads running at each respective prio level:
+- Work-stealing as the main approach to distributing work across WORKER THREADS/TASKS.
+- 
+- On small sytems, havign a signle worker thread running at high prior which services (drains) URGENT Q first, then the PROMPT Q, is sufficient in most cases. BACKGROUND, IDLE can be drained in an analogous way by a 2nd lower-prio GC thread. FROEGROUND ALWAYS RUNS IN A "NORMA:" application-level prio.
+
+??? How to preevnt finalizers form being coded in bad ways, from doing things that are not wise, safe, or sane at all?
+
+1. Blocking, esp. long-term blockign operatiosn are usually a big problem, more so if they block for long only occasionally/rarely and unpredistcably.
+Therefore, a key mechanism to retain both responsiveness and programming flexibility is to have allowed and disallowed types of ops for the different classes of finalizers/split finalizers.
+
+OPENING OF FILES, DB CONNECTIONS, AND OTHER SIMILAR SLOW IO: allowed only for idle class.
+DELETION OF FILES, TEARING DOWN OF (LIKELY) SLOW COMMS CHANNELS: allowed only for idle, backrground class.
+TCP SOCKET CLOSURE with waiting for graceful drainage and teardown: idle, background.
+TCP SOCKET CLOSURE with minimal/ungraceful teardown: idel, bakground, foreground, prompt.
+UDP, RT protocol teardown: all.
+
+
+
+
+
+-------------------------------------------------------------------------------
+GC: preemption points, stack scans, stack mutation barriers
+
+Design decision: using SHADOW STACKS for holding GC-SCANNABLE refs/ptrs.  It leads to slightly slower normal execution (when not in a GC phase); but:
+- modern CPU architectures tend to have enough registers to be able to host an extra shadow stack ptr (16/32/more GPRs)
+- having a sepaarte shadow stack somewhat simplifies stack scanning
+- it is potentialy more memory efficient and cache friendly during stack scan (especially in languages which do not encourage proliferation of refs/pointers due to use of value types (structs), inline object allocation/containment, low-garbage culture, etc.)
+Expected ref/ptr content of common uses is 5-15% of what a unified execution stack would take up
+- NOTE: only managed refs/ptrs which are tuly needed as GC roots need to be pushed/popped on the shadow stack; NOT all refs/ptrs in the source code! Lots of room for compiler optimization there, with and without designer/programmer hints!
+- it is easier, cleaner, and more concurrency and parallelism friendly
+
+Potential shadow stack push elision optimizations:
+- no need to push ref/ptr which is already for sure present on prev stack frame (e.g. during procedure call - if caller has it, it's already accounted for -- callee has NON-ESSENTIAL REF COPY).
+- no need to push NON-OWNING COPIES OF refs/ptrs -- the type system which supports multiple objct ownership and access mode semantics helps here
+- static analysis can often prove that an owning ref will be go in another GC-visible location, so we do not need the on-stack ref for retaining the object; such cases are very common actually:
+-- a new object is created, only to be tucked into a datastructure (usch as a collection or messaging channel, or some global or semi-global) practically immediately, within the same procedure frame, in easy to detect ways; the ref then is no longer live on the local stack (i.e. THE REF HAS BEEN MOVED off the local stack, and only a TEMP COPY of it existed on it) => liveness analysis
+-- a REFOUNTED LEAF OBJECT???
+
+THERE ARE BASICALLY THE FOLLOWING SHARING MODES OF OBJECTS:
+
+
+
+
+-------------------------------------------------------------------------------
+What do we do with DUPLICATE refs/ptrs pushed onto a single (shadow) stack?
+- Option 1: sort using appropriate sorting algorithm then eliminate duplicates from the array... => NO, expesnive, and usually NOT wort it as duplicate rate will be low under reasonable liveness analysis/compiler optimizations.
+- Option 2: do nothing, rely on usual coloring to deal with already visited graph nodes.
+- Option 3: ??? 
+Choice: Option 2: Do nothing special.
+
+
+
+
+
+
+
+-------------------------------------------------------------------------------
+
+
+Lots of GC and non-GC MM burdening comes from UNCLEAR OWNERSHIP.
+Refs/Ptrs MUST have RICH WNERSHIP TYPING, more or les user-visible, and definitely tracked by the compiler in LIVENESS AND SHARING ANALYSIS.
+
+
+
+
+
+-------------------------------------------------------------------------------
+RETRACE AVOIDANCE OPTIMIZATIONS:
+
+1. (the greatest one) Memory regions maintain remembered lists/sets/bitmaps into other regions.
+2. (second greatest) ... into THEMSELVES to allow for partial scanning most of the time. ???
+
+Mem Regions optimized for mostly-longlived objects vs ones for mostly-shortlived objects
+
+
+Immutable objects are nice in that they do not need GC write barriers when written to under any circumstances, as they cannot be written to by definition.
+
+
+INCREMENTAL STYLE FEATURE: when e.g. chasing a squence of ref-linked objects, we (well, the compiler or JIT) keeps track of whetehr we are PASSING THROUGH AN OBJECT (i.e. obj graph node) WHICH IS TAGGED AS GCSCANWALL. If yes: if we WRIE a REF/PTR to any object of the object subgraph below this object, we MUST ADD THAT REF/PTR TO A REMEMBERED LIST for the GC to see it; if no: the subgraph isn't behind a scanwall, and will be scanned as usual by the graph tracer.
+Practical isue: how de we know if we have crossed a scanwall-ed object, when we could be starting from "middle" of objgraph, past a scanwall, due to having been passed a ref by someone else and/or missing an update which tagged an obj as scanwall? Serious concurrency, parallelism perf and corectness issues here...
+
+Hmm. Parallel processing of geenral and even simple tree/linear chain graphs is DIFFICULT, EXPENSIVE, AND VERY NON-RT WHEN THE GRAPHS ARE MUTABLE, AND LARGE (or even not so large). 
+
+
+BY THE WAY, HOW DO WE MANAGE REMEMBERED LISTS, e.g. upate content (ading is easy), un-remember stuff??? Across scans/Gc stages...
+- We DON'T. Practically always, remebered sets cause some lingering of actually inaccesible objects/subgraphs (a single leaf object is a degenrate subgraph), until next full(er) GC cycle causes suffucuent retrace to get rid of stale "memories" of a ref (i.e. not including that ref in the newly gathered remembered set).
+This is sometimes (NOT insignificantly rare, can be a real problem!) a cause for accumulation of dead objects, and/or for suboptimal promotion to old(er) generations.
+
+A possible and very often substantially useful mitigation:
+Objects of guaranteed unique ownership (because of type system) can get dropped the moment the only logically valid ref is null-ed or overwritten???
+NOT SO EASY! Dangling remembered ref!
+
+
+Bitcards? Conservative scanning (anything that looks like an obj ref is treated as a potential one...?) of bitcarded regions... hmm, potentially lots of memory traffic, long pauses, absolute cache thrashing... not quite RT-friendly....
+
+
+
+Remembered LOCATIONS?
+- enQ the written-to-object's objref (NOT actual mem address, as that would mean great headaches with asynchronous object moves/compaction) FOR RESCAN
+These Qs get drained frequently, mark/remarks dring GC cycles (major, minor, incremental, middle???)
+NOT efficient for large objects to scan... such as arrays, maps, trees with posible thousands, millions, and even more refs inside...
+DO IT SMARTLY, i.e. ADAPTIVELY.
+In the GC write barrier:
+- if obj to be written to is <N elementary obj slots: enque entire objref- if not, enq (objref, N_of_elementary_cell_actually_writing_to) struct ( objref; seqNcell;}
+- for obejcts which receive lots of writes likjely all over the object: bitcard will be more memory efficient.
+
+
+NOTE: CLASSICAL TRACING GC DOES *NOT* GUARANTEE THAT AN ACTUALLY UNREACHABLE OBJECT WILL BE FREED EVER!!! IN MOST POPULAR PRACTICAL GCs, a "ZOMBIE FOREVER" IS (IN PRINCIPLE) POSIBLE, BUT *ALMOST* NEVER HAPPENS IN PRACTICE.
+
+A dificulty is that:
+- Some object instances and some obj types have predictable lifecycles, so they can be "frozen" during most of their life after an inital formation/growth/filling-with-refs stage; others cannot as they go through periodic or aperiodic, sometimes practically random falls and rises of mutation activity of their ref/ptr content.
+- If we had tagged mmeory at the lowest machine level, it owuld have been much simpler.
+
+Option 1: 1 or several tag bits per posible ref/ptr slot in objct's body. For 32-bit refs, this woudl mean AT LAST 1/2 overhead; for 64-bit refs/ptrs it is 1/64. GRATEST PROBLEM: each write to a GC-write-barrier-protected (GC-modification-monitored) object would take 1 extra write in addition to the actual ref/ptr write, and it is would be a fairly random memory access for non-small objects.
+
+For small objects, it would be fairly cheap though: a small bitmpa is sufficient for such objects, say a 16-bit, 32-bit, or 64-bit machine word, held in obj header.
+Ref/ptr containg cell =!= elemnatry obj allocation cell. One hosts the ref/ptr, the other one (part of) an obj itself.
+
+Op
+
+
+JUST A FEW NUMBERS NOT TO FORGET:
+- if BW is 1GB/s, 1MB takes 1ms to read/write in the BEST CASE theoretical scenario; 1KB resp. 1us.
+And a few oher things not to forget:
+- algorithms complexity AND amount of work (problem size) to do AND typical/avg/max cost per individual unit processed ALL MATTER FOR PRACTICAL GC.
+
+Some (many?) important datastructures can be optimized for speed/footprint/thruput/latency of GC (GC-focused optimization) or "normal" program access. Some for both. Usually only for one though. GC thruput vs latency vs auxiliary memory and CPU footprint present another set of trilemmas/tri-conflicts.
+Often giving up small amounts of correctness in all situations (corner cases) can lead to massive speedup/resource reduction of common cases.
+
+C++/CLI ???
+
+
+!!! --------------------- ULTRA-IMPORTANT DESIGN DECISION ON INVARIANTS RE REFCOUNTS VS REACHABILITY VIA TRACER ------------------- !!!
+Hmm, the below isn't REALLY CORRECT; CORRECTNESS VIOLATION!!!
+
+A purist approach: reachability via tracing has the final word on whether obj is indeed live or not. Recorded refcount always >= true reachability-controlling links-to-object count (= when no cycles present, > when object is part of a cycle).
+A more flexible approach: tracing may not yet have happened (fully); it is ok to fin and free the object when its refcount goes to 0. Whichever becomes 0 first -- recorded refcount or N of traced links-to-object triggers its collection/freeing. THIS ALLOWS REFCOUNTED OBJECTS (WHICH ARE REFCOUNTED MOSTLY/JUST BECAUSE WE WANT THEM NOT TO LINGER AROUND BUT BE RECLAIMED PROMPTLY AFTER ACTUAL UNREACHABILITY) TO HAVE THE RIGHT INTENDED SEMANTICS -- OF BEING PROMPTLY FIN/FREED.
+
+CORRECTED VERSION OF THE ABOVE:
+- Remembered sets ALL have a MAYBE-NATURE: they contain POTENTIAL LINKS to the trget objs; but the GC DOES NOT ASSUME EACH MENTIONED LINK HAS A VALID TARGET. The target obj MAY have gone away in the meantime, if e.g. the source of the link was overwritten and the target obj is refcount-controlled and had refc go 0.
+- As long as a valid (i.e. itself reachable) ref/ptr exists anywhere in user-accessible program state (as opposed to a maybe-nature remembered set hiden away from user code!), the object is reachable (by definition!) and if that object is refcounted, its refc MUST BE POSITIVE. We NEVER EVER allow missed refc INCEMENTS, though in certain circumstances we by necesity or by dsign allow (occasionally) a missed DECREMENT (imprecise, opportunisitc refc; cycles are another thing...).
+
+
+But what do we do in the tracer with lingering refs (perhaps in various remembered lists/sets, bitmaps, ref Qs, etc.) to objs pronounced dead by refcounting? We don't want dangling refs nor unsafe memory ops:  FOR THE HYBRID REFCOUNTED-TRACED OBJECTS, WE USE A TOOMBSTONE FLAG BIT IN THE OBJTABLE. ALL OPS ON SUCH AN OBJECT ARE NOOPS.
+!!! NOTE: A TOMBSTONE FLAG BIT IS ONLY MEANINGFUL IF STORED IN AN OBJTABLE, *NOT* IF HELD INSIDE THE INLINE OBJECT HEADER INSIDE THE OBJECT. Inline header is indivisble from the object body, allocation-wise, so would be killed prematurely.
+
+!!! GENERAL OBSERVATION: HAVING A RECORD ABOUT THE OBJECT KEPT OUTSIDE OF THE OBJECT ALLOWS THIS RECORD TO HAVE A SEPARATE, LARGELY INDEPENDENT LIFETIME. THIS IS EXTREMELY USEFUL FOR MANY MANY LIFECYCLE AND RESOURCE MANAGEMENT TASKS, FROM VERY BASIC TO HIGHLY ADVANCED.
+
+
+Having such an external obj directory makes things like temporarily removing an object from GC realm somewhat easier than if using inline obj header.
+
+
+An alternative would be to maintain an already-killed set of objs, with which to filter the maybe-nature of the rembered sets prior to actually touching any obj allegedly retained by the remset. On destruction of a refcounted obj, the destructor checks if the object is from young-space and if so, adds itelf to the already-killed set. This is directly extendable to region-based GC, with simply per-region already-killed set.
+
+
+
+-------------------------------------------------------------------------------
+IMMUTABLE/CONST OBJECTS CONTAINING REFS/POINTERS are easier to deal with. Truly immutable such objects if put in a place/memory region and referencing objects outside it so that a rememberd set is required will have a REMSET WHICH IS ALSO IMMUTABLE -- WILL STAY THE SAME AFTER CREATION UP UNTIL THE OBJECT IS COLLECTED, WHICH WILL TRIGGER COLLECTION OF THE REMSET RAW OBJECT TOO.
+
+
+-------------------------------------------------------------------------------
+Introducing a MIDAGED generation for GC => FLUID GENERATIONAL GC System
+Objects may end up promoted to the old/tenured gen, but then expectedly or unexpectedly, cyclically or not, become "HOT" again. They may (OFTEN SHOULD) be moved back to young gen  or bst to an intermediate gen talored to their needs.
+
+TYPES OF OBJECT HOTNESS RE GC/MM:
+- Resizing (mostly focus on grow ops -- shrink can often be in-place without need for alloating new buffer(s)).
+- Writing of refs/ptrs to mutable obj. Practically, a certain number/percentage of overwrite will probably be needed to consider an object "hot", not just "lukewarm" or "warming up"
+
+
+In a naive/simple implementation, once used (consumed), a bitcard woudl have to be cleared (zeroed), or swapped for a prezeored one for lower latency (if  Q of prezeroed bitcards exists and isn't empty).
+
+Bitcards operating at a potentially ref-containing slot (32-bit or 64-bit) for implementing precise REMSETS is not practical.
+Bitcards at 128-bit granularity aren't, either.
+Bitcards of Elementary Obj Cell size: 32B/64B START getting close to practical: 4 in 1000 vs 2 in 1000 memory footprint, respectively.
+Bitcards of 1KB start becoming too big: large scan time, perf would be poor on sparsely-touched objects.
+512B (used in some popular JVMs) is kind of decent; 256B may be better, and 128B seems to be a pracitcal minimum (1 in 1000 mem overhead).
+BITCARDS =!= OBJCARDS, which are on obj allocation granularity and mark proeprly formed OBJECTS, not just opaque memory space like bitcards do.
+
+
+!!! RELIABILITY, SECURITY, PERFORMANCE: Bitacards and Objcards both have PREDICTABLE SIZES, driectly proportional to object/heap/mem region size. Ref/ptr Qs on the other hand can grow, oveflow, and CONTAIN DUPLICATES if not spcifically filtering those out. Naive dsign which has somethign like a loop repeatedly overwriting a ref/ptr field in an objct under write capture can easily bomb any such Q within milliseconds. Keeping the Qs as trees or hash maps to ensure deduplication is: definitely prohibitively expensive for trees, and still too expensive for hash maps. Hash maps CAN be ok for infrequent writes of small number of refs/ptrs, but otherwise perf will be bad, as will mem footprint. Hsh maps of many slots woudl need highly random accesses, too, so the advantages over way simpler bitmaps go away.
+
+Generational GC costs may be too high and inappropriate for some/many applications... making writes to much of the heap(s) that expensive -- if the writes are frequent enough; adding memory overheads and CPU and potential latency overheads for processing and cleaning those bitmaps...
+
+??? Could it be: ref-containing objects criteria for tenure conflating unchanging size and bulkiness (=> avoidance of compaction moves) and unchanging ref contents?
+
+Hmm. Per-object tenure states and write capture control???
+Hierarchical???
+In obj header (inline or external...???):
+{ flag:1 bit: dirtied by ref/ptr write during this cycle: yes/no}
+{flag: tenured: yes/no} Wait, this is determined by the mem region it resides in... But what if we could de-tenure/have a sub-tenured/half-tenured/conditionally tenured state, per-object?
+The whole idea of encountering a REF TO TENURED REGION IS TO *NOT* FOLLOW THAT REF AT ALL DURING SCAN!!! So, using this flag to de-tenure will NOT work -- flag wouldn't be read at all.
+
+
+
+
+
+-------------------------------------------------------------------------------
+Saving on costly gc write barriers is a very important thing to do. It helps when we already know which generation (or memory region) we are linking to (and from), so we can avoid/lower check costs and some other costs if possible.
+- new objects: small/certain types created on young/eden, some directly as tenured, some elsewhere???
+- typesystem and allocation hints and mandatory directives can help a lot => lifecycle control for types and individual objects
+
+
+TENURED->TENURED, YOUNG->YOUNG, YOUNG->TENURED links need NOT be recorded in any way
+YOUNG->YOUNG 
+YOUNG->TENURED
+TENURED->YOUNG links MUST be recorded: cross-generational, remembered sets
+
+When it is scanning time:
+TENURED->TENURED during tenured and full GC (if such is needed and exists)
+YOUNG->YOUNG during young GC, before tenured GC, a part of full GC...
+YOUNG->TENURED must not be followed during young-only (minor) GC -- that's part of the point of gen gc;not having to rescan old objects every time
+
+-------------------------------------------------------------------------------
+
+Thoughts:
+
+ A system effective by design will tend to stay effective. A system not specifically designed to be effective might happen to be by coincidence, or after a lot of retrofitting, but more often than is convenient it turns out to be cheaper and better to build a new effective by dsign system instead.
+ 
+ REALTIME SYSTEMS WITH MOSTLY LIVE, LIKELY LIVE AND HOT DATA DO NOT ALWAYS BENEFIT MUCH OR AT ALL FROM GENERATIONAL GC, AS THEY MAY NOT ACTUALLY HAVE ENOUGH OLD GEN OBJECTS (GENERATIONAL HYPOTHESIS DOESN'T APPLY TO THEM). THE EXTRA OVERHEADS OF GENERATIONAL STRUCTURE MAINTENANCE IN ITS FULL WILL LIKELY (AND PRACTICE HAS BEEN DEMONSTRATED TO) HURT RT PROPERTIES.
+ - Rembered sets are not for free: memory overhead, scanning time, extra cahce pollution.
+ - Write barriers tracking cross-generational (old->young) links are not free.
+ - Other object segregations (small-big-huge, pointer content %, mutability, leaf, ...) may and do prove more beneficial to take advantage of.
+ - simpler GC runs faster, needs less code => better fit in I-cache, flash memory, etc.
+ - simpler non-generational GC is easier to make hybrid with some refcounting.
+
+
+-------------------------------------------------------------------------------
+
+Large Datastructure Drop (LDSD)
+
+Situation: an array/hash map bucket/tree gets dropped in one go (due to either refcount or unique ref drop or single-owning-multiple-weak refs drop). We can either leave this to be nadled in the usual way when INCREMENTAL_COLLECTION_COLLCT=no, or:
+if objheader has tag...
+
+
+
+
+
+
+
+
+Reasoning:
+1. Deciding when to do refcounting and when to skip it (non-mandatory refcount, refcount as early death detection optimization) is tricky.
+TYPES OF REFCOUNTING:
+1. Mandatory refcount: the object's lifecycle is CONTROLLED SOLELY BY REFCOUNT, i.e. TRACING IS TURNED OFF FOR THIS OBJ/TYPE.
+2. Opportunistic refcount: NOTE: REFC INCREMENTS CAN NEVER BE SKIPPED -- would cause premature freeing -- BUT DECREMENTS CAN, leaking the object temporarily until tracing GC takes care.
+2.1. Strongly desired refcount: refcount is the primary (but not sole) mechanism for controlling the object's lifetime; usually for objects which are large so they'd better be reclaimed as timely as possible, or for ones requiring (very) prompt finalziation, or sometimes both. Tracing is still enabled on the object, as a backup/last line of defence. WE TRY HARD NOT TO SKIP DECREMENTS, BUT IT MAY HAPPEN IN RARE CORNER CASES.
+3. Opportunistic refcount: refcount as optimization, to be executed only when expected to be beneficial. Will leak objects occasionally, but it's fine -- tracing gc will take care later.
+
+The thing with refcounting is that it MUST be propagated down object graph in order to do anything at all.
+Objects which have MANDATORY  refcount therefore REQUIRE EVERYTHING CONTAINING OR POINTING TO THEM TO HAVE MANDATORY REFCOUNT AS WELL. Aditionally, the same finalizer must be run promptly by the tracing gc if it is the one to actually collect any such referring-to-mandatory-refcounted objct.
+=> MANDATORY REFCOUNT IS TRANSITIVE; IT IS ACTUALLY *NOT* THE REFCOUNTING THAT IS THE MAIN THING, IT IS JUST THE SIMPLEST MECHANISM TO ATTACK THE PROBLEM OF PROMPT FINALIZATION.
+=> STRONGLY DESIRED OPPORTUNISITC REFCOUNT is TRANSITIVЕ AS WELL -- wouldn't be effective nor efficient -- hence of much use -- otherwise.
+
+OPPORTUNISTIC REFCOUNT AS OPTIMIZATION MUST ON THE OTHER HAND BE KEPT AS NOT IMPOSING TRANSITIVITY. THEN, THE VALID QUESTION ARISES: IS IT WORTH HAVING SUCH A HALF-THING AND OFTEN PAYING (MUCH OF THE) COSTS OF REFCOUNTING AND ALL OF THE COSTS OF TRACING, PLUS SOME COSTS FOR ALLOWING THE HYBRID, FOR BENEFITS WHICH MAY OR MAY NOT BE REALIZED....
+
+-------------------------------------------------------------------------------
+
+
+To avoid unnecesary or weakly beneficial work:
+Collection/container objects are tagged in the obj header with
+
+
+
+-------------------------------------------------------------------------------
+
+
+
+An alternative/aux of card marking:
+1. marking entries in the OBJTABLE: per object 1 bit: DIRTY_OLD_TO_YOUNG
+-- This allows FULLY PRECISE MARKING (unlike raw/fast bitcard).
+-- This IS a bitcard, but from OBJID SPACE not HEAP RAM ADDRESS SPACE.
+-- 1 giga objects will consume 1 Gbits === 128MBytes, which is actually completely OK from memory consumption view. Multiple giga objects an be had simultaneously in an application address space /GC domain.
+
+There are challenegs, of course, and disadvantages.
+- Concurrenttly running GC threads.
+- Concurrent mutators trying to set bits in parallel -- lost updates if doen without any atomics or memory barriers at least to publish set bits in time for anothr setter to see it's a set bit not  0.
+2. 
+
+BITCARDS AND HEAP ZONING/SEGREGATION: 
+Other object segregations (small-big-huge, pointer content %, mutability, leaf, ...) may and do prove more beneficial to take advantage of.
+
+In most/many programs, most program memory will be used by ref/ptr-fre objects (strings, byte/other blob buffers, integer arrays, float arrays, arrays of structs, etc.).
+
+-------------------------------------------------------------------------------
+Measures to make bitcard and object scanning efficient, while maintaining type sytem flexibility, regarding containment etc.
+
+RECOMMENDATION: NOT dispersing/intermixing ref/ptr-containing fileds/subobjects and ones containing non-scannable daat, for faster scanning process (fewer CPU instructions executed, less cache use, fewer word fetches).
+
+Obj header:
+ref_containing_offset
+[headers...][ potentially some non-ref-containing part such as tags, in-obj length or count fields etc.][ref and non-ref mixed data][non-ref data tail/trailer]
+obj header fields:
+scan_start_offset
+scan_end_offset
+
+Object size model:
+
+bitmap: ref-sized slots, 32-bit or 64-bit each
+(T) Tiny objects: 8-bit bitmap
+(S) Small objects: 16-bit bitmap
+(M) Medium objects: 32-bit bitmap
+(M+) Medium+ objects: 64-bit bitmap
+(L) 
+
+
+Array-style objects:
+------------------------
+Every GC-controlled object has a header; each such header has an Object Style and Shape set of flags and tags.
+OBJ__SCANNABLE: 2 bits: { no, only_refs, partial_scattered, partial_nested_objs}; these 4 options selcect variants of the gc cacnner routine
+OBJ__SIZE_CLASS: 2 bits :{ ONEBYTE, WORD, DWORD, QWORD}; word is in the common x86 16-bit meaning, dword is 32 bits, quadword is 64 bits; NOTE: THESE CONTROL THE SIZE OF THE OBJ__SIZE header field (for compact representation)
+OBJ__SIZE: 8/16/32/64-bit object size field; NOTE: OBJECT SIZE IS IN ELEMENTARY OBJECT ALLOCATION CELL UNITS, SO 32/64BYTES EACH -- NOT IN BYTES NOR MACHINE WORDS!!! ALSO, OBJ__SIZE is always >=1 under normal circumstances (0 has a special reserved meaning!)
+In this way,  1-byte size of this field can cover 256*32 or 256*64 bytes of obj size -- 8KB or 16KB resp., quite compact!
+Array-style objects: allowing for up to 16 64-bit words of offset before pointer containing section starts: offset stored in 4-bit uint4 obj header field
+Arrays of only refs/ptrs to objects:
+- if only allwoing refs to scannable types:
+flag: BODY__SCANNABLE_ONLY: 1 (yes) 0 (no)
+
+
+The tail of objects -- part of last elemntary obj allocation cell unfilled by object data -- is MANDATORILY ZEROED at object init )or is prezeroed); the GC SCANNER MUST SEE IT ZEROED AT ALL TIMES.
+
+True structs: const-size type of same or different fields which contains no refs/ptrs and is never not scannable. A TRUE struct contains no: objct header, vtable ptr(s), object size, length, etc. attributes.
+True class: always contains: vtable ptr(s) -- soem of which could be DECLARED STATIC INTERFACE vptr(s); 
+
+
+
+-------------------------------------------------------------------------------
+Immutable objects:
+- Ref/ptr-free: easy, we don't scan those at all
+- What if there are refs/ptrs? Can we use this to accellerate scanning? Large immutable datasets... analytics, batch processing, non-batched realtime/dynamic queries...
+Mutable ref/ptr containing objects still need to participate in the objgraph tracing, as dropping an immutable object can and does cause cascading dropping of other refs/ptrs... just like any other object.
+
+What is needed here is  a DISTINCTION OF CONSTANT/CONSTANTLY VALID/HELD/RETAINED DATA -- WHICH IS NOT THE SAME AS IMMUTABLE OBJECTS!
+CONST HEAP, MORE OR LESS THE PERMGEN CONCEPT -- DATA WHICH IS OUTSIDE THE NORMAL DOMAIN OF GC, AND WHICH MIGHT BE FREEABLE AND MIGHT INDEED GET FREED, BUT ON COMMAND FROM OTHER SOURCES AND BY OTHER MECHANISMS (PERHAPS EVEN MANUAL).
+
+OFTEN, LOTS OF SUCH DATA IS BEST MANAGED THRU:
+- MANUAL BULK MEMORY MANGEMENT
+- REFCOUNTING, OR EVEN MEMREGION/BLOCK/BULK REFCOUNTING
+
+PROPSED MECHANISM: 
+If you know huge chunks/swaths of data will not change, nad will need to stay as is -- why not TELL THE GC/MM EXPLICITLY? After all, the architect/designer/developer sometimes know best and know well and know already things which would cost the gc way too much effort.
+SEMI-PERMGEN:
+Object in this generation/meta-region are excluded from normal GC operation:
+- they are not considered for deallocation;
+- do not have refs/ptrs into this region followed during tracing;
+- ???do NOT point back into non-permanent spaces; in essence, a PERMANENT OBJECT CAN ONLY POINT TO OTHER PERMANENT OBJECTS
+- PERM OBJECTS MAY BE IMMUTABLE OR NOT -- THIS IS A SEPARATE THING FROM BEING OF PERMANENTLY PRESENT NATURE
+
+- can have sub-regions TAGGED WITH REGION IDs, and entire such regions can BE DROPPED AT ONCE BY EXPLICIT COMMAND: gc_drop_perm_region(REGION_TAG(value));
+
+
+-------------------------------------------------------------------------------
+
+Bitcard scan time grows linearly with its size, which means with heap size (if it is a raw memory/fast bitcard) or gc-controlled object count (if it is per-object).
+Techniques to sped that up, so we do not need to crawl thru:
+- hardware: bit manipulation instructions (BMI, ABM, etc.) to find first set bit in a 32-bit or 64-bit word.: modern x86, x86_64, ARM since ARMv5, MIPS, PPC, SPARK, etc have suitable instructions for these.
+- skipping larger blocks of all-0 (non-marked) data:
+-- skip if 32/64-bit word == 0x0
+-- SIMD 128-bit, maybe 256-bit tst for all-0s ???
+
+
+Next-cacheline prefetching is active on most CPUs of today; DRRx DRAM also does some prefetching; therefore, memory ops on a small number of adjacent cachelines (typically 64B/CL on most CPUs now, soemtimes 32B, sometimes 128B (a trend for near future))
+
+??? Using pagefaults on first access to pages of the bitmap, then in pf handler marking the touched pages. Unpredictable and non-RT friendly latency of PFHandling, and is it worth it??
+??? Non-PF approach: 2 writes per bitcard entry set, on a hierachical bitcard:
+- bitcard entry itself;
+- used bitcard page map (level 2): say per 64KB to 1MB worth of heap space...
+
+
+
+When do we set a bitcard entry? - When writing a cross-gen/cross-region non-null (any of possible several null-values!) ref/ptr anywhere in the mem area covered by this entry.
+When can we clear a bitcard entry? 
+- When ALL potentially linked-to objects have been promoted to tenured space. NOTE: moving merely to survivor space doesn't qualify.
+- When the card is provably not containing ANY possible valid ref to young gen.
+- Depending on GC design/style, and actual heap conditions: When MAJOR or FULL  GC happens, draining all remembered sets. NOTE: this doesn't always happen after MAJOR/FULL GC!!!
+-------------------------------------------------------------------------------
+Why mark bitcards for heaps from which the cross-gen/cross-regional links comes and not the other way around: mark the target object as bein in use by an older gen / by another region?
+Old an nw regions need not be managed in dramatically different ways...
+Well, it's not that simple. 
+
+
+Option 1) Old->young Q of entries: (tenured_objref, young_objref): recorded by every mutator thread
+Option 2) Dirtied Old->(unidentied and potentially changing many times) young objref: Q of (tenured_objref) only
+Option 3) more elaborate version of option 2: (tenured_objref, +offset_into_tenured_obj) to record the offset that was dirtied
+Option 4) more elaborate version of option 3: (tenured_objref, +start_ofset_into_tenured_obj, +end_offset_into_tenured_obj) to be able to express dirtied ranges
+
+
+When very sparse dirtying happens, of very small dirtied spots (i.e. single or few clsoe-by ref/ptr slots are dirtied here and there in the tenured spaces), recording the exact dirtying sites will allow the best, and usually very very quick scanning (no need to skip over irrelevant data; no conservative marking at all).
+
+When entire medium to large objects (100s to 1000s of ref/ptr slots) such as collections/containers get massively dirtied (have more than say 10% of possible ref/ptr slots dirtied), markign the entire such ref/ptr-rich object for scan will be the most effective way.
+When the same kind of objects receive an intermediate, sparser dirtying, and if that dirtying is clustered, it may be most efficint to use bitcards -- possibly granularity-tuned to the size, nature, ref/ptr content % of the object, and other detaisl of the nature of the object.
+
+-------------------------------------------------------------------------------
+NUMA awareness, modular support for quite differing NUMA variants
+numa_alloc(...) family of procedures
+
+
+
+-------------------------------------------------------------------------------
+Fixed vs variable total size and GEOMETRY for heap(s), zones, regions
+
+Native heap(s): NOT ALL OF RAM IN AN APPLICATION IS MANAGED BY THE GC/MM; THERE ARE RUNTIME-PRIVATE STRUCTURES, AS WELL AS USER-MANAGED OFF-GC-HEAP/MANUAL-HEAP(S).
+
+For MOST but NOT ALL GC-managed areas, sizes and geometry are fixed at application launch because this helps with making range checks, identifuin what points where, faster at the machine level. However, being very rigid isn't good for varying workloads, TLB perf, and is especially costly on modern resource-sharing environments such as hypervisor VMs, conatiners, jails, etc.
+
+For this purpose, we use hybrid virtual address space layouts. We UNMAP large empty chunks of VAS; we UNBACK PHYS MEM FROM OTHERS WITHOUT FULLY UNMAPPING THE VAS (ie.. we remove phys mem commitments, releasing phys mem to be used by other apps, OS, hypervisor as need be).
+
+
+
+-------------------------------------------------------------------------------
+Bloom filters, efficient hash maps, ...
+
+-------------------------------------------------------------------------------
+GC and objects with finalizers:
+- objects whose fin has been triggerd by refcount mechanism: they have been taken care of by the finalizer already, in one way or another
+- tracing is the bigger challenge: tracing visits the objects taht are LIVE; NOT the ones that are dead (and potentially need fin). What we need to run fin is precisely the objects that are DEAD AND NEED FIN.
+What is needed is an effective and efficient way of:
+- the set of all objects potentially subject to fin
+- the tracer to mark off all reachable objs from that set
+- the remaining set will be the ones we need to run fin on, via adding those to the various fin Qs or immediately.
+This is mark-and-sweep.
+
+NOTE: there may be MANY OBJS potentially subject to fin, in a server-type/DB-type/off-heap-storage-using application. DEFINTIELY POSSIBLE TO HAVE MILLIONS OF FILE DESCRIPTORS, NETWORK/COMMS SOCKETS, RAW STORAGE ACCESS HANDLES, AND OTHER HANDLES. When it comes to TCP/UDP/OTHER COMMS SOCKETS ON SERVERS WITH SEVERAL TB OF RAM (DESNITY ONLY EXPECTED TO KEEP GROWING, FAST, AND TO DO THAT AT EEVR MORE AFFORDABLE PRICING - HENCE BECOMING COMMODITY), 10-20M SOCKETS HAVE BEEN DEMONSTRATED ON 1 MACHINE, WITH 50-100M ALSO FEASIBLE ON BIGGER MACHINES; WITHIN A FEW YEARS 100-200m THEN 500+m WILL BE PRACTICALLY ACHIEVABLE AND INCREASINGLY USED FOR CERTAIN IMPORTNAT APPLICATION CLASSES.
+WE MUST BE ABLE TO SCALE WELL TO SUCH NUMBERS OF FINALIZABLE OBJECTS.
+
+
+
+
+
+
+
+DOUBLE-CHECKED LOCKING: NOT ALWAYS EVIL
+non-atomic read(); if supposedly free then lock/try_lock fro real else if busy spinloop or sleep()/mutex-wait()
+What do we win? for mostly busy objects, we save a read barrier
+??? Is it worth it?
+
+
+-------------------------------------------------------------------------------
+Manual and base memory management functions/features
+
+Delayed manual/refc subgraph destruction:
+
+delayed_destroy(objref, DELAY_OPTS);
+delayed_destroy(ptr, DELAY_OPTS);
+
+
+
+
+Destroying ENTIRE MEMORY REGIONS AT ONCE:
+
+
+How to do it safely:
+A. Without presence of tracing GC (only manual or manual+refc mgmt)
+B. With limited tracing GC
+C. With full automatic background tracing GC
+
+
+
+-------------------------------------------------------------------------------
+Object lifetime hints and control (OLHAC): whne the architect/designer/developer knows more
+
+Per-kind, Per-type, Per-object tenuring control: min_gens: , max_gens:
+
+
+
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+Atlassian Git
+- user-installable server: Bitbucket; avail for teams
+
+Bitbucket Server
+
+Git based code hosting and collaboration for teams
+A single server deployment
+Perpetual license + free year of maintenance
+Try Server
+Data Center
+Bitbucket Data Center
+
+Hosted in the cloud:
+Free
+FOR SMALL TEAMS
+$0/ user / month
+Free for up to 5 users
+s Bitbucket free for small teams?
+Yes! Bitbucket is free for individuals and small teams with up to 5 users, with unlimited public and private repositories. You also get 1 GB file storage for LFS and 50 build minutes to get started with Pipelines. You share build minutes and storage with all users on your team or personal account.
+
+Git based code hosting and collaboration for teams
+Active-active clustering for high availability
+Smart mirroring for performance across geographies
+Annual term license + maintenance
+Try Data Center
+- 
+
+Github
+- web:
+Choose a plan
+GitHub is free to use for public and open source projects. Work together across unlimited private repositories with a paid plan.
+Free
+$0
+Includes:
+Personal account
+Unlimited public repositories
+Unlimited collaborators
+There are millions of public projects on GitHub. Join one or start your own for free.
+Sign up for free
+Developer
+$7
+per month
+
+Includes:
+Personal account
+Unlimited public repositories
+Unlimited private repositories
+Unlimited collaborators
+Free for students as part of the Student Developer Pack.
+Sign up
+
+
+
+JIRA:
+- self-hosted: Server $10 total flat fee (NOT per user!) one-time payment perpetural license for <= 10 users
+- web/cloud hosted by Atlassian themselves: Up to 10 users $10 total monthly flat fee (NOT per user!) -- it's a special price for small teams
+
+UberSVN
+
+???WinSVN server??? lightweight???
+
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------

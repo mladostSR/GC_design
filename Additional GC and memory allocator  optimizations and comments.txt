@@ -1,0 +1,29 @@
+* An uninformed GC is a very bad thing
+Example: a memory-intensive part of the the execution of an application starts allocating lots of memory, in lots of objects. The GC is unuaware/not made aware that such a thing is about to happen, and applies a slow-memory-growth rate high-level strategy with frequent attempts at cleaning up space (which is un/anti-productive). It would have been much more appropriate to:
+- explicitly let the programmer/architect notify the memory management system that is about to happen:
+{ 
+	gc_start_allocation_spree()
+	...
+	gc_end_allocation_spree()
+}
+- and/or use adaptive auto-tuning:
+-- adjust allocation block quanta based on prev allocations and trends
+
+
+Container and collction-type major datastructures which need to/had better do complex capacity/memory management of their own (usually NOT fully sidestepping the GC, but rather building upon its underlying/lower-level/general services): resizeable hash maps, trees, hybrids, and similar
+- what is definitely not nice is to have scenarios such as
+- often many instances of such kinds of datastructures tend to be big in overall footprint! => avoid useless costly ops
+- they often tend to trigger or be part of the reasons/events that trigger excessive/unfruitful compaction (with the ensuing retargetting runs)
+
+IT *MAY* (IT IS A MAJOR QUESTION OPEN TO RESEARCH) be feasible and useful to be be able to choose beteen 2 modes of memory/rsource/object monitoring per kind, type, and instance/object:
+1. the thing is presumed to be non-garbage as a whole
+
+
+Mode 1: the object is always considered to be non-grabage === be live => manually managed
+Mode 2: the object is considered to be non-grabage === be live , unless the refcount on it goes to 0 => fully refcounting discipline
+Mode 3: The object is considered to be likely mostly-live, with potential (small) portions of it being eligible for scan and free
+
+
+
+
+

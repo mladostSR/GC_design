@@ -1,0 +1,39 @@
+Memory Management and GC -- Refs and pointers -- The different types of nulls and types of Weak References
+
+
+Nulls:
+One type is NOT sufficient. Ad-hoc attribution of maning to a single physical null value (0x0)  creates confusion and (sometimes subtle) confusion).
+Better define a few types of system-wide, (quite) cosnsitent nulls.
+
+NOOP-null: this null causes a no-op (i.e. doing nothing) when dereferenced. Loads, stores, and calls thru such a null do nothing.
+
+Task panic null: causes the propagation of a task panic (exception/rapid exception).
+
+
+Object not present null: causes the runtime to try to (re)load the object.
+
+
+Weak refs:
+1. simple cache refs: point to objects which can be purged by the GC or some other (application-level) logic to free resources when under pressure. THESE OBJECTS MUST BE IMMUTABLE TO AVOID COMMIT STORMS, STATE/DATA LOSS, AND OTHER TROUBLES.
+2. 
+
+weak ref -> control object -> target address if any (if obj is present) + flags/control data
+Weak refs are not cheap!!!
+
+2 levels of weak refs: 
+1. cache refs -- when dropping the ref is not a big deal (the object behind it is relatively chap to recreate)
+2. firm refs -- when dropping is much more expensive
+3. back refs -- when 
+
+Back refs for linked structures such as trees, lists, and toher more general graphs are NOT exactly THAT sort of weak refs!!!
+
+
+Some objects are relocatable (the most common GC-managed obejcts); some are but normally wouldn't be relocated; some are pinned to their location (non-relocatable). NOTE: THERE IS NO CONVERSION relocatable -> pinned, in the interest of implementation simplicity, performance, and predictability of behavior (real-time properties etc.). Ref->Pointer remapping is needed (the alternative being patching of the scattered references sitting inside objects across the program address space -- this is SLOW, usually VERY RT-UNFRIENDLY, and DEPENDS ON HIGHLY NON-PORTABL SYSTEM-SPECIFIC TRICKS WITH PAGING ETC.).
+
+Global and task-local OBJECT MAP (OM) -- lets task-local GC and MM do their job with minimal bothering of the global ones.
+
+??? (Some) refcounts could be contained in that OBJECT MAP structure ???
+??? What about other object attributes -- object header in part or in full ???
+
+Where are refcounts and other object metadata best held? This is NOT a trivial question!!!
+

@@ -1,0 +1,29 @@
+GC and programming language design -- key optimisations and patterns not to to miss
+
+
+Whole-object allocations for linked strucutures:
+Imagine creating a classical singly or doubly linked list, with hundreds to tens of nodes. If that happens to be short-lived, doing mass-free and/or copying of linked objects around can cost quite a lot of CPU ccyles and memory traffic without doing much good to the overall system.
+
+
+Adaptive Generational Promotion (AGP):
+- SOME objects get COPY COUNTERS (how many times, ROUGHLY, has this object been copied by copying generational GC in the young generation(s)). This allows us to pull objects with a semmingly high likelihood of long life outside of the "hot" i.e. youngest object spaces, to avoid copying them over and over again too many times.
+
+TYPE AND OBJECT EXPECTE LIFE LENGTH HINTS: In many cases, a well-informed architect and/or programmer has a fairly good idea of how long, in relative terms, the typical objects created from a type, or even particular objects, will likely (or certainly) live. This can lower MM and/or GC pressure/load by saving unneeded operations (copying, some tracing in certain cases)
+
+
+
+REGION-BASED ALLOCATION:
+
+
+A SIMPLER, AUTOMATIC, ADAPTIV/SELF-TUNING "SOFT" REGION-BASED ALLOCATION:
+1. Initially, an object is crated in the normal, default young space.
+2. IF the object tends to "go together" (be clsutered in lifecycle) with fellow objects, these get moved over together to a separate subspace i.e. region of their own
+3. Objects can be moved back if they no longer "go together" well.
+
+Permgen
+Tenured generation
+Young generation : Nursery | Survivor
+
+
+Length-limited strings:
+string { curr_size; max_size; ctl_flags; [data...]}

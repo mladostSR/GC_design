@@ -1,0 +1,174 @@
+SNR - Memory Management and GC -- Co-design of key datastructures and memory management
+
+Important principles:
+0. Avoid excessive indirection, and provide choice of variants of DS which are not overly generalized (usually, being very general means lots of pointer/ref and other types of indirection)
+1. Indirection has costs which need to be understood and managed; pointers, references, objects are not free.
+2. Design choice about (a few) datastructures affect overall memory mgmt/GC behavior, complexity, and viability tremendously.
+3. (Extreme) object-orientism creates a proliferation of indirection, memory bloat, object count bloat, proliferation of (helper) types, and excessive GC load.
+4. Slight duplication of fields and small objects, and wasting a few words of memory, is almost alays cheapr than using indirection to small objects to hold the common data. The cost of managing a pointer/ref in a GC environment (and otherwise) is much greater than that of small value-type objects (even if they are 4-8x bigger than that pointer).
+5. Unique, recounted, and off-heap allocations done behind the scenes in (a few) key datastructures can ease GC load a lot. Not everuthing has to be managed in the same general way.
+
+
+Strings: MONOLITHIC OBJECTS: HEADER AND CHARACTER ARRAY IN ONE (it's cheap to copy a small header, simpler and better than havign to indirect to a separate character buffer; also, with immutable strings, the ref to the entire string object can be shared).
+Purists may not like the use of a variable-length array as part of an object, but it is easy to implement and easy on GC/machine resources, too.
+String: { header, []chars }
+header: { lang_code, script_code, caps_ctl, }
+And the susual GC hader tack in front of all that...
+
+String flavors: allocation garnualrity
+There are string objects which are only a few characters long, but most are at least tens of characters long. To allow efficient alloction, copying, and alignment:
+1. Strings are allocated as at least 128-bit (16 bytes) big objects, hader included.
+2. The allocated space for a string grows in AT LEAST 128-bit (16 byte) increments.
+
+LinkedLists:
+0. Linked lists of very small objects is a bad idea. Pointer/ref storage overhead, load dependencies and prefetching difficulties on CPU level, scattering across cache lines, and potential for scattering across virtual memory pages (horrible perf in swapping scenarios, and devatating for GC performance!)
+1. Chained arrays are much better in most cases. Pointer overhad remains, but the other overheads are lowered drsctically.
+3. On 64-bit machines, it makes sense to offer linked structures which do not use actual full-size pointers/refs but rather shorter index-like references, valid only within the linked structure instance, which restricts uses somewhat, but is often sufficient.
+Semi-random-access structures are overall more useful than fully sequential linked ones.
+4. With increase in object sizes, some of these relative overheads drop rapidly. Linked structures of big objects are cheap (of course the objects are not, in terms of occupied mmory, but it's not linking overhead).
+5. Using uniformized object sizes wastes some meory, but makes fast and compact allocator structures and techniques possible, and conytibutes much to realtime-ness.
+
+operations:
+
+add_back, add_front
+
+
+HashMaps:
+0. Chained hash smap of small types is a BAD idea.
+1. Moderate waste of space for roomier buckets is almost always cheaper overall than packing tightly, and scales better the larger a hash map gets overall.
+2. Chaining with linked lists is inefficient; buckets are better off as arrays/vectors
+3. Copying a small number of small elements or the array/vector that contains them is often substantially faster and more predictable than plain linked list allocation and GC traversal overheads, especially for longer-lived maps and map entries.
+
+PRIVATE MEMORY ALLOCATION BUFFERS (REGIONS) AND LOCAL GC OPTIMIZATION TECHNIQUES:
+for objectX use allocation_region;
+
+A STRICT DIFFERENCE BETWEEN COLLECTIONS AND CONTAINERS, WHIH HAS TREMENDOUS MEMORY MANAGEMENT IMPLICATIONS AND OPTIMIZATION BENEFITS:
+COLLECTIONS ARE USED TO POINT TO THINGS; THEY CONTAIN REFERENCES TO THE THINGS BUT NOT THE THINGS THEMSELVES
+CONTAINERS CONTAIN THE THINGS THEMSELVES, AND THIS PERMITS USING REGIONS AND SUBALLOCATORS OPTIMIZED FOR THE SIZE AND OTHER PROPERTIES OF THE CONTAINED THINGS. ALSO, ONE CANNOT LEGALLY OBTAIN A DIRECT REFERENCE TO A THING INSIDE A CONTAINER, AS THIS ACTUALLY MAKES LITTLE SENSE. (Imagine a tin can of tomato cubes -- can you access the tomatoes directly? You first need to open the tin and take them out.)
+
+But how do we refer to objects insie containers:
+2 ways: via a CONTAINED OBJECT COMPOUND REFERENCE, AND VIA SEPARATE CONTAINER REFS AND INDEX-LIKE ACCESSORS/ITERATORS, WHICH FOLLOW A COMMON FRAMEWORK BUT ARE TYPE-SPECALIZED, NATURALLY (with regards to whether they support random access, insertion, deletion, etc.)
+
+Insertion, deletion, and semi-random-access structures:
+
+Persistency of references, accessors/iterators, and defenses/checks against concurrent and haphazard modification: we want no insiduous iterator bugs, and no heisenbugs either!
+Well, the strict and clear difference betwen containers and collections helps here too:
+A NORMAL, STANDALONE OBJECT REFERENCE TO AN OBJECT PART OF A COLLECTION IS NOT AFFECTED IN ANY WAY BY COLLECTION OPERATIONS (THE COLLECTION MERELY CONTAINS OTHER REFERENCES TO THE SAME OBJECT).
+COLLECTION OPERATIONS
+
+Collection and container kinds:
+- "normal" versions of the datastructures which use THE GENERAL ALLOCATION MECHANISMS AND ARENA(S) OF THE SURROUNDING (DYNAMIC) EXECUTION CONTEXT;
+- "BIG/STANDALONE" versions which use their own (sub) arena(s)/regions and allocation mechnisms/strategies.
+Architect/programmer decides which to use where; libraries and runtime can also make auto-tuning decisions!
+Otherwise, "normal" and "BIG" versions are fully interface-compatible.
+
+How? On initilization/instantiation, collections and containers init an internal set of variables:
+0. []allocators -- an array of several different allocators for different types of allocations
+1. []upper_ctx_allocators -- support allocator chaining, for each of the used types of allocators
+2. alloc_dealloc_flags
+
+
+
+freelist implemented as a stack???
+free(): push the cell index (NOT raw memory addres, as that would kill relocatability/GC!!!) formerly occupied by the object onto stack
+allocate cell by simply popping off the stack; ADDED BENEFIT IS MEMROY PAGE AND CACHE LOCALITY FOR FREE (the most recently used space gets reusd first, potentially whil still being "hot"/"warm"); multiple-object freeing and allocation are possible, trivial, and very cache-efficient to do in one go too! STACKS ARE WONDERFUL!!!
+COMPACTNESS AND LOW MEMORY USAGE IS POSSIBLE FOR THE STACK: NO NEED TO USE POINTER-WIDE CELL IDs: often e.g. 16-bit or 32-bit cell id's will be enough even on 64-bit machines.
+
+
+Freelists (as an abstract datastructure, most often to actually implemented as linked lists!) are EXCELLENT:
+- for managing large and medium-sized allocations
+- for nearly-full allocation regions/arenas
+- for non-moving and rarely-moving GC
+- for scan-avoiding/smart-scan GCs
+
+
+memory region:
+- control fields: parameters, flags, tags
+- "list" of chained MACROBLOCKS OR MEGABLOCKS (1 to several or even many); in some cases a tree will be needed
+- "list" of scan buffers for outgoing and incoming pointrs/references/iterators/slices/accessors
+- "list" of various scan/no-scan bitmaps
+- not everything will be prsent always; avoid bloat and have only what is truly needed
+
+
+
+3 kinds of memory regions:
+- simple (non-recursive)
+- recursive (tree)
+- linear recursive (non-branching nesting) -- a degenerate tree, simpler and somewhat cheaper processing
+
+
+
+
+
+
+
+
+-------------------------------------------------------
+An idea about how to deduplicate incoming (and possibly outgoing) references:
+- usual hash maps (chained): OK for occasional inserts, when response time isn't critical; OK for regions containing large-ish objects
+A logical pseudocode flow:
+region_add_incoming_ref(ref):
+if hashmap.contains(ref) return;
+else hashmap.add(ref)
+
+Of course, in practice, the checkand add operations will be FUSED, for efficiency (elimination of a call, searching for bucket only once, good cache locality, etc.)
+
+An alternative, possibly better suited for regions containing small objects: have the varible-length hash map sort of degenrate to a bitmap, with 1 bit per possible object loation (i.e. OBJCT STORAGE CELL)
+E.g. 1 bit per 32B, or per 64B, or per whatever the region is tuned for.
+Actually, medium-size and big objects allocated on big chunks/size increments can be managed effectively and efficiently via bitmaps too.
+
+
+-------------------------------------------------------
+
+Getting object sizes: a compiler and runtime which help you in sane ways
+
+Objcts are of 2 kinds when it comes to knowing their sizes:
+- ones whose size is fixed and thus statically known (the compiler knows it and can tell you the number)
+- ones whose size is only known at runtime
+Minor adjustments to the occupied size due to runtime-imposed alignment and other overheads must not be nglected either; they are logically NOT affecting the size of the object per se, rather the size of THE PACKAGING IT RESIDES IN DURING ACTUAL EXECUTION.
+Objects whose size can vary are variable-length objects.
+
+Transitive object sizes, i.e. the size of the object plus all the other objects it epends on (points to) is YET ANOTHER, MORE COMPLEX MATTER. OBJECT GRAPHS CAN SHARE OBJECTS, THUS THE SIZE OF AN OBJCT GRAPH ROOTED AT OBJECT X  IS NOT ALWAYS WELL-DEFINED!!! Adding in the different ownerships posible over shared objects (different SHARING MODES), we shoudl be very careful in defining sizes and size-reporting functionalities.
+
+'size property: returns the object's OWN size
+'graph_size_est(SHARED_TREATMENT_FLAGS) property: function call that returns a DYNAMIC *ESTIMATION* OF THE OCCUPIED SPACE OF THE OBJECT GRAPH ROOTED AT THIS OBJECT, BEING SUBJECT TO CONCURRENT/ASYNC OPERATIONS WHICH MAY CHANGE THIS SIZE -- it is IMPRACTICAL AND INTRUSIVE to stop any and all activities affecting that graph
+SHARED_TREATMENT_FLAGS:
+- 
+
+
+
+OBJECT OWNERSHIP AND SHARING:
+- symmetric sharing: all sharers equally own the object, and each reference to that object from those sharers is a retention-causing one in GC/refcount terms
+- asymmetric sharing: not all references are created equalBasically (there are subtler details though!) the language's type system and libraries distinguish between OWNING  an OBJECT and HAVING BEEN GIVEN SOME ACCESS/RIGHTS OF USE to an object.
+
+
+
+
+
+Thread-local pools and objects:
+
+
+
+=== OWNERSHIP === IS A HUGE TOPIC
+
+Kinds of allocation:
+- fully static: space set aside by compiler
+- start-of-app: somewhat in-between static and dynamic (technically, it's dynamic, but with somewhat special properties)
+- start-of-module/start-of-task: similar
+- dynamic
+
+
+
+Allocation/new object creation parameters:
+Applicable to both statically allocated and dynamically allocated objects:
+
+Statically allocated only
+Dynamically allocated only:
+
+
+Dynamic allocation expected lifetime hints and directives:
+HINT: just a hint, may or may not actually happen
+DIRECTIVE: a command which the compiler and/or runtime must obey
+
+
+
