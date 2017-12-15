@@ -830,8 +830,29 @@ Each of the clases HAS A SEPARATE (SET OF) FIN Qs, A SEPARATE FIN SET MAP, and o
 
 ALSO NOTE: THE USUAL APPROACH TO AGE-ONLY/MOSTLY-BASED GENERATIONAL GC DOESN'T PLAY WELL WITH FIN. TENURED GC runs are good for thruput, but kill promptness. THEREFORE, WE MUST *NOT* ALLOW SUCH A CONCEPTUALLY FLAWED NAIVE MEM-CENTRIC BUT PROMPT FIN-UNAWARE DESIGN IN THE FIRST PLACE!!!
 Remember the hybrid refc+tracing arrangements already discussed: esp. that when we rally want to have adequate refc, we need to impose reguirements on transitivity -- it is similar with fin.
+BEHAVIORAL CORRECTNESS REQUIREMENT: PROMPT, URGENT, IMMEDIATE FIN OBJECTS *MUST* BE *LOGICALLY* ALLOCATED AS PART OF THE YOUNG GEN, SO THY UNDERGO SCANNING WITH IT. URGENT AND IMMEDIATE FIN OBJECTS ARE ALSO ALWAYS REFCOUNTED.
+ALSO, THIS IS TRANSITIVELY REQUIRED OF ANY OBJECT CONTAING OR POINTING TO THOSE!!!
 
-So, there we go. Promptness of finalization is at deep odds with generational GC.
+So, there we go. Promptness of finalization is at deep odds with generational GC, forcing partial abandonment of generational approach.
+
+
+!!!IMPORTANT: MANUAL FINALIZATION:
+
+
+-------------------------------------------------------------------------------
+ABSOLUTELY KEY DESIGN DECISION RE MANUAL FREEING/DELETION/DESTRUCTION/FIN ON OBJECTS:
+- Combining manual memory management and tracing or hybrid GC is a necessity for many low-latency and/or large-memory applications.
+- Even fast young copying GC is not always of sufficient low latency and thruput. Copying objects a few times arounf until they reach age to be promoted to tenured space(s) is still memory copy operation, and it actually doesn't add value to the end use (not saying that compaction isn't extremely useful and often better than alternatives -- it just still has costs, and is NOT ALWAYS better than alternatives).
+- Allwoing random manual MM  *ON GC-OWNED OBJECTS* is not always feasible, safe, nor actually good for perf.
+- Cleanest, least confusing, least error-prone way is to have separate, non-overlapping memory domains for (tracing/hybrid) GC-owned xor manually-managed  xor refcounted mem, with some cross-domain link facilities (remsets etc.).
+- Old gen: CMS CAN allow manual obj deletion (with proper synchro). The sweep phase is not substantially diffrent from a series of manual deletions.
+- Young gen: 
+-- YC (Young COPYING), aka normal young: we do NOT EVER MARK NON-FIN OBJECTS HERE -- WE COPY THOSE DIRECTLY ASAP. A delete() here is a no-op re freeing memory (it cannot free an object mem block which will anyway become a hole the moment we drop the last ref/ptr used to invoke the delete() on the obj), but it is OK and trivial to invoke the finalizer of the obj in case it has one (is FIN) in IMMEDIATE FIN MODE; we can also, without much complications, call a fin() directly (it will b equivalent to elete() in this case), or fin_enq() to enqueue the finalizer for later run with the other finalizers on the Q (of course, this makes no sense as YC gc would do that anyway). ??? Speding up the process for immediate, urgent... -- hmm???
+-- YNC (Young Non-Copying), for large and some other objects : this is a speedier, slimmed down and peculiarly tuned form of CMS. All that applies to old gen CMS applies, with tuning details.
+
+NOTE RE FIN OBJECTS: ALL FIN OBJS EXCEPT THOSE IMMEDIATELY FIN OBJS WHICH HAVE BEN ALREADY FULLY FIN'ed *MUST* BE KEPT ALIVE, THUS COPIED, OVER TO THE SURVIVOR SPACE AS THEY HAVE TO STAY ALIVE AFTER THE TRAE-COPY PHASE TO LET THE FINALZIERS WORK ON VALID, EXISTING OBJECTS!!!
+-- 
+
 
 
 DOUBLE-CHECKED LOCKING: NOT ALWAYS EVIL
