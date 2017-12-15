@@ -851,8 +851,17 @@ ABSOLUTELY KEY DESIGN DECISION RE MANUAL FREEING/DELETION/DESTRUCTION/FIN ON OBJ
 -- YNC (Young Non-Copying), for large and some other objects : this is a speedier, slimmed down and peculiarly tuned form of CMS. All that applies to old gen CMS applies, with tuning details.
 
 NOTE RE FIN OBJECTS: ALL FIN OBJS EXCEPT THOSE IMMEDIATELY FIN OBJS WHICH HAVE BEN ALREADY FULLY FIN'ed *MUST* BE KEPT ALIVE, THUS COPIED, OVER TO THE SURVIVOR SPACE AS THEY HAVE TO STAY ALIVE AFTER THE TRAE-COPY PHASE TO LET THE FINALZIERS WORK ON VALID, EXISTING OBJECTS!!!
--- 
+-- If the obj is FULLY FIN'ed -- which is controlled by a flag in its OBJ HEADER, then there is NO need copying its dead remains over to survivors Ibut it still CAN be copied over -- not prohibited).
+-- If it's PARTIALLY FIN'ed (remember the layered, split-fin fin model) -- it MUST still be copied over to survivors.
 
+!!!=> YET ANOTHER OBJ HEADER FLAG: we alredy have the FIN general flag signallign to the GC that it is in principle a finalizable object which must receive the finalization subsystem's attention; FIN_CLASS tag; the FIN_STARTED and FIN_DONE flags are added.
+FIN_STARTED serves to keep an objct from multiple, CONCURRENT OR NOT, finalziation attempts. It is (atomically, whne/if needed) set to 1 when the objct enters finalization, and is LEFT AS 1 AFTER FIN FINISHES (i.e not reverted back to 0); FIN_DONE is set to 1 when the obj is fully finalized (this :=1 can be optimized out if the context makes it unnecessary).
+
+YET ANOTHER ABSOLUTELY KEY OBSERVATION:
+When an object contains HANDLES OF ANY SORT TO FINALIZABLE/CLOSEABLE RESOURCES (usch as, but not limited to: files, sockets, IPC fd's, message queue handles, DB connection handles/control objects/interfacing objects), these are semantically trated to be "references" very similar to the refs to objects. So:
+- 
+-
+- 
 
 
 DOUBLE-CHECKED LOCKING: NOT ALWAYS EVIL
