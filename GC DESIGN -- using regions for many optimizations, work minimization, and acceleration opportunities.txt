@@ -823,13 +823,15 @@ Whn it comes to scanning fin sets, overcentralization is again usually a perform
 Managing concurrent/parallel access to such centralized structures is more expensive than dealign with task/thread private ones, too. Avoiding locking, atomics, and usually having better cache locality.
 Also, object lifecycle patterns such as garbage creation rates and massive object expiry (collections going dead, large complex transactions or sesions going dead, ...) tend to differ a lot between different tasks/threads, so putting all in one bowl is typically bad for prformance.
 
+NOTE: On a generational GC system, we MUST have GENERATIONAL FIN as well -- simply because which objs are actually live and which are dead can only be knwon after the GC has finsihed its run for the resp. generation. Similarly for region-based MM.
+
 REMINDER: THE CLASSES OF FINALIZATION PROMPTNESS: FIN_{IDLE, BACKGROUND, FOREGROUND, PROMPT, URGENT, IMMEDIATE}
 Each of the clases HAS A SEPARATE (SET OF) FIN Qs, A SEPARATE FIN SET MAP, and other support data structures. The different fin sets are scanned at different times, too: IDLE, BACKGROUND, FOREGROUND get swept ONLY after major/full GCs.
 
 ALSO NOTE: THE USUAL APPROACH TO AGE-ONLY/MOSTLY-BASED GENERATIONAL GC DOESN'T PLAY WELL WITH FIN. TENURED GC runs are good for thruput, but kill promptness. THEREFORE, WE MUST *NOT* ALLOW SUCH A CONCEPTUALLY FLAWED NAIVE MEM-CENTRIC BUT PROMPT FIN-UNAWARE DESIGN IN THE FIRST PLACE!!!
 Remember the hybrid refc+tracing arrangements already discussed: esp. that when we rally want to have adequate refc, we need to impose reguirements on transitivity -- it is similar with fin.
 
-
+So, there we go. Promptness of finalization is at deep odds with generational GC.
 
 
 DOUBLE-CHECKED LOCKING: NOT ALWAYS EVIL
